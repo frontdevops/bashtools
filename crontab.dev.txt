@@ -1,0 +1,28 @@
+# Job file for the "dev" environment — replace these demo jobs with your own.
+#
+# cronsetup appends jobs here; cronedit turns them on and off and installs
+# the result into the system crontab:
+#
+#   ./cronsetup dev            add a job with the wizard
+#   ./cronedit dev --dry-run   see the crontab these jobs would produce
+#   ./cronedit dev             pick what runs and install it
+#
+# Format notes:
+#   - the comment directly above a job becomes its label in the picker
+#   - a commented-out job line is a job that exists but is switched off
+#   - crontab environment variables are carried over untouched
+
+MAILTO=""
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Nightly database backup — every day at 04:00
+0 4 * * * /srv/app/bin/backup-db.sh >> /var/log/backup-db.log 2>&1
+
+# Session cleanup — every 30 minutes
+*/30 * * * * /usr/bin/php /srv/app/cli.php sessions:prune >> /var/log/app-cron.log 2>&1
+
+# Weekly report — Mondays at 09:00 (switched off on dev)
+#0 9 * * 1 /usr/bin/php /srv/app/cli.php report:weekly >> /var/log/app-cron.log 2>&1
+
+# Warm the cache after a reboot
+@reboot /srv/app/bin/warm-cache.sh >/dev/null 2>&1

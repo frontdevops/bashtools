@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+
+# Install a crontab from crontab.dev.txt / crontab.prod.txt
+#
+# New jobs are added with the cronsetup wizard; this script turns them on and off.
+#
+#   ./cronedit dev       — pick interactively which jobs from crontab.dev.txt to run
+#   ./cronedit prod --dry-run
+#
+# Selected jobs toggle their source-file state in the installed crontab.
+# Unselected jobs keep their source-file state; toggles do not update the file.
+
+set -Eeuo pipefail
+
+# Resolve the script path through symlinks: cronedit may live in /usr/local/bin
+# while crontab.*.txt lives in the project directory.
+resolve_script_dir() {
+    local target="$1" dir
+    while [[ -L "$target" ]]; do
+        dir="$(cd "$(dirname "$target")" && pwd)"
+        target="$(readlink "$target")"
+        [[ "$target" == /* ]] || target="$dir/$target"
+    done
+    (cd "$(dirname "$target")" && pwd)
+}
+
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
+
+# Where to look for crontab.<environment>.txt: CRONTAB_DIR first, then the
+# script directory, then the current directory.
+find_crontab_file() {
+    local env_name="$1" dir
+    for dir in ${CRONTAB_DIR:+"$CRONTAB_DIR"} "$SCRIPT_DIR" "$PWD"; do
+        if [[ -f "$dir/crontab.$env_name.txt" ]]; then
+            printf '%s' "$dir/crontab.$env_name.txt"
+            return 0
+        fi
+    done
+    return 1
+}
+
+searched_dirs() {
+    local env_name="$1" dir out="" seen=""
+    for dir in ${CRONTAB_DIR:+"$CRONTAB_DIR"} "$SCRIPT_DIR" "$PWD"; do
+        case "$seen" in
+            *"|$dir|"*) continue ;;
+        esac
+        seen+="|$dir|"
+        out+="
+    $dir/crontab.$env_name.txt"
+    done
+    printf '%s' "$out"
+}
+
+ENVIRONMENT=""
+DRY_RUN=0
+SELECT_ALL=0
+DELETE_MODE=0
+
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+CYAN="\033[0;36m"
+BOLD="\033[1m"
+DIM="\033[2m"
+NC="\033[0m"
+
+log() {
+    echo -e "${CYAN}➜${NC} $1"
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}!${NC} $1"
+}
+
+error() {
+    printf '%b %s\n' "${RED}✗${NC}" "$1" >&2
+}
+
+die() {
+    error "$1"
+    exit 1
+}
+
+hr() {
+    echo -e "${DIM}──────────────────────────────────────────────${NC}"
+}
+
+flush_tty() {
+    { : < /dev/tty; } 2>/dev/null || return 0
+    while read -r -t 0.05 -n 10000 _ < /dev/tty 2>/dev/null; do :; done
+    true
+}
+
+usage() {
+    cat <<USAGE
+Usage: $(basename "$0") <dev|prod> [options]
+
+  dev             read jobs from crontab.dev.txt
+  prod            read jobs from crontab.prod.txt
+
+  --all           enable every job (no picker, no toggling)
+  --delete        pick jobs and delete them from the source file
+  --dry-run       show the resulting crontab without installing it
+  -h, --help      show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        dev|prod) ENVIRONMENT="$1"; shift ;;
+        --all)     SELECT_ALL=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --delete)  DELETE_MODE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; die "Unknown argument: $1" ;;
+    esac
+done
+
+[[ -n "$ENVIRONMENT" ]] || { usage; die "No environment given: use dev or prod"; }
+
+SOURCE_FILE="$(find_crontab_file "$ENVIRONMENT" || true)"
+
+clear 2>/dev/null || true
+
+echo -e "${BOLD}${CYAN}"
+echo "Crontab Setup Utility — $ENVIRONMENT"
+echo -e "${NC}"
+
+hr
+
+# Without the crontab binary the script can only preview the result (--dry-run).
+if command -v crontab >/dev/null; then
+    HAS_CRONTAB=1
+else
+    HAS_CRONTAB=0
+    CRON_HINT="crontab not found — install the cron package: sudo apt install -y cron && sudo systemctl enable --now cron"
+    [[ "$DRY_RUN" -eq 1 ]] || die "$CRON_HINT"
+    warn "$CRON_HINT"
+    warn "Continuing in --dry-run mode: the resulting crontab is shown but cannot be installed"
+fi
+[[ "$SELECT_ALL" -eq 1 ]] || command -v fzf >/dev/null \
+    || die "fzf is not installed — run: sudo apt install -y fzf"
+
+[[ -n "$SOURCE_FILE" ]] || die "crontab.$ENVIRONMENT.txt not found. Looked in:$(searched_dirs "$ENVIRONMENT")
+    Point to the directory explicitly: CRONTAB_DIR=/path/to/project $(basename "$0") $ENVIRONMENT"
+
+log "Source: $SOURCE_FILE"
+
+# The current crontab is used both for the "already installed" marker and the backup.
+if [[ "$HAS_CRONTAB" -eq 1 ]]; then
+    CURRENT_CRONTAB="$(crontab -l 2>/dev/null || true)"
+else
+    CURRENT_CRONTAB=""
+fi
+
+if [[ -n "$CURRENT_CRONTAB" ]]; then
+    CURRENT_ACTIVE="$(printf '%s\n' "$CURRENT_CRONTAB" | grep -cE '^[^#[:space:]]' || true)"
+    success "Current crontab: $CURRENT_ACTIVE active line(s)"
+else
+    warn "Current crontab is empty"
+fi
+
+hr
+
+# --- Parse the source file ---
+#
+# Every line falls into one of three kinds:
+#   job     — a cron job (active or commented out)
+#   env     — a crontab environment variable (PATH=, MAILTO=, SHELL=)
+#   text    — a comment or blank line, carried over as is
+#
+# LINE_KIND/LINE_BODY hold the file line by line, JOB_* hold jobs only.
+
+CRON_RE='^[[:space:]]*#?[[:space:]]*((@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly))|([-0-9*/,]+[[:space:]]+[-0-9*/,]+[[:space:]]+[-0-9*/,]+[[:space:]]+[-0-9*/,a-zA-Z]+[[:space:]]+[-0-9*/,a-zA-Z]+))[[:space:]]+[^[:space:]]'
+
+LINE_KIND=()
+LINE_BODY=()
+LINE_JOB=()
+
+JOB_LINE=()
+JOB_CMD=()
+JOB_ENABLED=()
+JOB_LABEL=()
+
+ORIG_LINES=()
+
+last_comment=""
+line_no=0
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+    body="$line"
+    ORIG_LINES+=("$line")
+
+    if [[ "$body" =~ $CRON_RE ]]; then
+        # A job is active unless the line is commented out.
+        if [[ "$body" =~ ^[[:space:]]*# ]]; then
+            enabled=0
+            cmd="$(printf '%s' "$body" | sed -E 's/^[[:space:]]*#+[[:space:]]*//')"
+        else
+            enabled=1
+            cmd="$(printf '%s' "$body" | sed -E 's/^[[:space:]]+//')"
+        fi
+
+        JOB_LINE+=("$line_no")
+        JOB_CMD+=("$cmd")
+        JOB_ENABLED+=("$enabled")
+        JOB_LABEL+=("$last_comment")
+
+        LINE_KIND+=("job")
+        LINE_BODY+=("$cmd")
+        LINE_JOB+=("$((${#JOB_CMD[@]} - 1))")
+    elif [[ "$body" =~ ^[[:space:]]*[A-Z_]+= ]]; then
+        LINE_KIND+=("env")
+        LINE_BODY+=("$body")
+        LINE_JOB+=("-")
+    else
+        # The comment above a job becomes its label in the picker.
+        if [[ "$body" =~ ^[[:space:]]*#[[:space:]]*(.+)$ ]]; then
+            candidate="${BASH_REMATCH[1]}"
+            [[ "$candidate" == Install:* ]] || last_comment="$candidate"
+        elif [[ -z "${body// /}" ]]; then
+            last_comment=""
+        fi
+
+        LINE_KIND+=("text")
+        LINE_BODY+=("$body")
+        LINE_JOB+=("-")
+    fi
+
+    line_no=$((line_no + 1))
+done < "$SOURCE_FILE"
+
+JOB_COUNT="${#JOB_CMD[@]}"
+[[ "$JOB_COUNT" -gt 0 ]] || die "No jobs found in $SOURCE_FILE"
+
+success "Jobs found: $JOB_COUNT"
+
+hr
+
+# --- Build the picker list ---
+
+# A job counts as installed when the exact same line is active in the current crontab.
+is_installed() {
+    local cmd="$1"
+    printf '%s\n' "$CURRENT_CRONTAB" | grep -qxF "$cmd"
+}
+
+DISPLAY=()
+i=0
+while [[ $i -lt "$JOB_COUNT" ]]; do
+    cmd="${JOB_CMD[$i]}"
+
+    if [[ "${JOB_ENABLED[$i]}" -eq 1 ]]; then
+        state="on "
+    else
+        state="off"
+    fi
+
+    if is_installed "$cmd"; then
+        installed="in crontab"
+    else
+        installed="          "
+    fi
+
+    label="${JOB_LABEL[$i]}"
+    [[ -n "$label" ]] && label=" — $label"
+
+    # The schedule is the first 5 fields (or an @macro); the rest is the command.
+    if [[ "$cmd" =~ ^@ ]]; then
+        schedule="$(printf '%s' "$cmd" | awk '{print $1}')"
+        command_part="$(printf '%s' "$cmd" | cut -d' ' -f2-)"
+    else
+        schedule="$(printf '%s' "$cmd" | awk '{print $1, $2, $3, $4, $5}')"
+        command_part="$(printf '%s' "$cmd" | awk '{$1=$2=$3=$4=$5=""; sub(/^ +/, ""); print}')"
+    fi
+
+    DISPLAY+=("$(printf '%2d) [%s] [%s] %-16s %s%s' \
+        "$((i + 1))" "$state" "$installed" "$schedule" "${command_part:0:70}" "$label")")
+
+    i=$((i + 1))
+done
+
+if [[ "$DELETE_MODE" -eq 1 ]]; then
+    FZF_PROMPT="Delete ($ENVIRONMENT) > "
+    FZF_HEADER="Space: ☑ mark for deletion | Ctrl+A: all | Ctrl+D: none | Enter: continue | Esc: cancel
+Marked jobs are removed from the source file, together with their comment."
+else
+    FZF_PROMPT="Cron ($ENVIRONMENT) > "
+    FZF_HEADER="Space: ☑ toggle | Ctrl+A: all | Ctrl+D: none | Enter: apply | Esc: cancel
+Selected jobs flip on/off; unselected ones keep the state shown in [on/off]."
+fi
+
+SELECTED_IDX=()
+
+if [[ "$SELECT_ALL" -eq 1 && "$DELETE_MODE" -eq 0 ]]; then
+    # --all is an explicit "turn everything on", so only the disabled jobs flip.
+    i=0
+    while [[ $i -lt "$JOB_COUNT" ]]; do
+        [[ "${JOB_ENABLED[$i]}" -eq 1 ]] || SELECTED_IDX+=("$i")
+        i=$((i + 1))
+    done
+else
+    flush_tty
+    SELECTION="$(
+        printf '%s\n' "${DISPLAY[@]}" |
+        fzf \
+            --multi \
+            --marker='☑' \
+            --pointer='>' \
+            --bind='space:toggle,ctrl-a:select-all,ctrl-d:deselect-all' \
+            --height=20 \
+            --border \
+            --reverse \
+            --prompt="$FZF_PROMPT" \
+            --header="$FZF_HEADER" \
+        || true
+    )"
+
+    [[ -n "$SELECTION" ]] || {
+        warn "Cancelled — the crontab was left untouched"
+        exit 0
+    }
+
+    while IFS= read -r line; do
+        num="${line%%)*}"
+        SELECTED_IDX+=("$((num - 1))")
+    done <<< "$SELECTION"
+fi
+
+# Quick "is job N selected?" lookup.
+is_selected() {
+    local target="$1" idx
+    for idx in ${SELECTED_IDX[@]+"${SELECTED_IDX[@]}"}; do
+        [[ "$idx" -eq "$target" ]] && return 0
+    done
+    return 1
+}
+
+# --- Delete mode: drop the picked jobs from the source file ---
+
+if [[ "$DELETE_MODE" -eq 1 ]]; then
+    # Line numbers that hold a job, so walking up stops at the previous job.
+    is_job_line() {
+        local target="$1" n
+        for n in ${JOB_LINE[@]+"${JOB_LINE[@]}"}; do
+            [[ "$n" -eq "$target" ]] && return 0
+        done
+        return 1
+    }
+
+    DELETE_LINES=" "
+
+    for idx in "${SELECTED_IDX[@]}"; do
+        ln="${JOB_LINE[$idx]}"
+        DELETE_LINES+="$ln "
+
+        # The comment block glued directly above the job describes it, so it goes too.
+        prev=$((ln - 1))
+        while [[ "$prev" -ge 0 ]]; do
+            prev_body="${ORIG_LINES[$prev]}"
+            [[ "$prev_body" =~ ^[[:space:]]*# ]] || break
+            is_job_line "$prev" && break
+            DELETE_LINES+="$prev "
+            prev=$((prev - 1))
+        done
+    done
+
+    clear 2>/dev/null || true
+
+    echo -e "${RED}${BOLD}About to delete from the source file${NC}"
+    echo -e "${CYAN}File:${NC} $SOURCE_FILE"
+    hr
+
+    i=0
+    while [[ $i -lt "${#ORIG_LINES[@]}" ]]; do
+        if [[ "$DELETE_LINES" == *" $i "* ]]; then
+            echo -e "  ${RED}- ${ORIG_LINES[$i]}${NC}"
+        fi
+        i=$((i + 1))
+    done
+
+    hr
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        warn "Dry run: the file was not modified"
+        exit 0
+    fi
+
+    flush_tty
+    read -r -p "Type YES to delete: " CONFIRM
+    [[ "$CONFIRM" == "YES" ]] || die "Cancelled"
+
+    SOURCE_BACKUP="$SOURCE_FILE.bak"
+    cp "$SOURCE_FILE" "$SOURCE_BACKUP"
+
+    TMP_FILE="$SOURCE_FILE.tmp.$$"
+    : > "$TMP_FILE"
+
+    i=0
+    blank_run=0
+    while [[ $i -lt "${#ORIG_LINES[@]}" ]]; do
+        if [[ "$DELETE_LINES" == *" $i "* ]]; then
+            i=$((i + 1))
+            continue
+        fi
+
+        # Collapse the blank lines left behind by the removed block.
+        if [[ -z "${ORIG_LINES[$i]//[[:space:]]/}" ]]; then
+            blank_run=$((blank_run + 1))
+            [[ "$blank_run" -gt 1 ]] && { i=$((i + 1)); continue; }
+        else
+            blank_run=0
+        fi
+
+        printf '%s\n' "${ORIG_LINES[$i]}" >> "$TMP_FILE"
+        i=$((i + 1))
+    done
+
+    mv -f "$TMP_FILE" "$SOURCE_FILE"
+
+    success "Deleted ${#SELECTED_IDX[@]} job(s) from $SOURCE_FILE (backup: $SOURCE_BACKUP)"
+
+    hr
+    log "Apply the change to the system crontab with: $(basename "$0") $ENVIRONMENT"
+    hr
+    exit 0
+fi
+
+# --- Assemble the new crontab ---
+
+NEW_CRONTAB="# Installed by cronedit ($ENVIRONMENT) $(date '+%Y-%m-%d %H:%M:%S')
+# Source: $SOURCE_FILE
+# Edit the source file and run cronedit again rather than editing this crontab.
+"
+
+ENABLED_COUNT=0
+DISABLED_COUNT=0
+TOGGLED_COUNT=0
+TOGGLE_LINES=""
+
+i=0
+while [[ $i -lt "${#LINE_KIND[@]}" ]]; do
+    kind="${LINE_KIND[$i]}"
+    body="${LINE_BODY[$i]}"
+
+    case "$kind" in
+        job)
+            job_idx="${LINE_JOB[$i]}"
+            was_enabled="${JOB_ENABLED[$job_idx]}"
+
+            # Selected jobs flip their state; unselected ones keep what the file says.
+            if is_selected "$job_idx"; then
+                if [[ "$was_enabled" -eq 1 ]]; then
+                    now_enabled=0
+                else
+                    now_enabled=1
+                fi
+                TOGGLED_COUNT=$((TOGGLED_COUNT + 1))
+                if [[ "$now_enabled" -eq 1 ]]; then
+                    TOGGLE_LINES+="  ${GREEN}off → on${NC}   ${JOB_CMD[$job_idx]:0:80}"$'\n'
+                else
+                    TOGGLE_LINES+="  ${YELLOW}on → off${NC}   ${JOB_CMD[$job_idx]:0:80}"$'\n'
+                fi
+            else
+                now_enabled="$was_enabled"
+            fi
+
+            if [[ "$now_enabled" -eq 1 ]]; then
+                NEW_CRONTAB+="$body"$'\n'
+                ENABLED_COUNT=$((ENABLED_COUNT + 1))
+            else
+                NEW_CRONTAB+="#$body"$'\n'
+                DISABLED_COUNT=$((DISABLED_COUNT + 1))
+            fi
+            ;;
+        *)
+            NEW_CRONTAB+="$body"$'\n'
+            ;;
+    esac
+
+    i=$((i + 1))
+done
+
+clear 2>/dev/null || true
+
+echo -e "${GREEN}${BOLD}About to install${NC}"
+echo -e "${CYAN}Environment:${NC} $ENVIRONMENT"
+echo -e "${CYAN}Source:${NC}      $SOURCE_FILE"
+echo -e "${CYAN}Enabled:${NC}     $ENABLED_COUNT"
+echo -e "${CYAN}Disabled:${NC}    $DISABLED_COUNT"
+echo -e "${CYAN}Toggled:${NC}     $TOGGLED_COUNT"
+
+hr
+
+if [[ "$TOGGLED_COUNT" -gt 0 ]]; then
+    echo -e "${BOLD}State changes:${NC}"
+    printf '%b' "$TOGGLE_LINES"
+    hr
+fi
+
+echo -e "${BOLD}Active jobs:${NC}"
+printf '%s\n' "$NEW_CRONTAB" | grep -E '^[^#[:space:]]' | sed 's/^/  /' || true
+
+hr
+
+if command -v diff >/dev/null; then
+    echo -e "${BOLD}Changes against the current crontab:${NC}"
+    if diff <(printf '%s\n' "$CURRENT_CRONTAB") <(printf '%s' "$NEW_CRONTAB") > /tmp/.cronedit.diff 2>/dev/null; then
+        echo -e "  ${DIM}no changes${NC}"
+    else
+        sed 's/^/  /' /tmp/.cronedit.diff
+    fi
+    rm -f /tmp/.cronedit.diff
+    hr
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    warn "Dry run: the crontab was not modified"
+    exit 0
+fi
+
+flush_tty
+read -r -p "Type YES to install: " CONFIRM
+[[ "$CONFIRM" == "YES" ]] || die "Cancelled"
+
+hr
+
+# Back up the current crontab so a rollback is a single command.
+BACKUP_FILE="$SCRIPT_DIR/.crontab.backup.$(date '+%Y%m%d-%H%M%S')"
+printf '%s\n' "$CURRENT_CRONTAB" > "$BACKUP_FILE"
+success "Current crontab backed up to: $BACKUP_FILE"
+
+printf '%s' "$NEW_CRONTAB" | crontab - || die "Failed to install the crontab"
+
+success "Crontab installed ($ENABLED_COUNT job(s) enabled)"
+
+hr
+log "Roll back with: crontab $BACKUP_FILE"
+log "Remove jobs for good with: $(basename "$0") $ENVIRONMENT --delete"
+hr
+
+#EOF#

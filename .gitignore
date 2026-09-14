@@ -1,0 +1,5 @@
+# Backups written by cronedit / cronsetup
+.crontab.backup.*
+*.bak
+
+.DS_Store

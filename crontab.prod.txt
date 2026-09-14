@@ -1,0 +1,22 @@
+# Job file for the "prod" environment — replace these demo jobs with your own.
+#
+# Same format as crontab.dev.txt. Keeping one file per environment lets a
+# single repository describe every server without the schedules ever mixing:
+# the same job can run every 30 minutes on dev and once a night on prod.
+
+MAILTO="ops@example.com"
+
+# Nightly database backup — every day at 03:00
+0 3 * * * /srv/app/bin/backup-db.sh >> /var/log/backup-db.log 2>&1
+
+# Reminder emails — every hour on the hour
+0 * * * * /usr/bin/php /srv/app/cli.php mail:send-reminders >> /var/log/app-cron.log 2>&1
+
+# Weekly report — Mondays at 09:00
+0 9 * * 1 /usr/bin/php /srv/app/cli.php report:weekly >> /var/log/app-cron.log 2>&1
+
+# Monthly invoices — 1st of the month at 06:00
+0 6 1 * * /usr/bin/php /srv/app/cli.php billing:invoices >> /var/log/billing.log 2>&1
+
+# Session cleanup — hourly (switched off on prod for now)
+#0 * * * * /usr/bin/php /srv/app/cli.php sessions:prune >> /var/log/app-cron.log 2>&1
