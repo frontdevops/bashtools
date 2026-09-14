@@ -240,6 +240,29 @@ cron/
 - Every destructive step needs a typed `YES`; `Esc` in any picker cancels
 - `--dry-run` covers both installing and deleting
 
+## Screenshots
+
+Captured from the actual scripts and `fzf` in a demo terminal session. The
+crontab data is mocked; no system crontab was installed.
+
+### cronedit — toggle jobs
+
+Only `[on]` is green. Marked jobs will switch states after confirmation.
+
+![cronedit job picker](screenshots/cronedit.png)
+
+### cronedit — review changes
+
+Review the state changes and crontab diff before typing `YES`.
+
+![cronedit installation review](screenshots/cronedit-review.png)
+
+### cronsetup — choose a schedule
+
+The wizard builds a job from the command, schedule, output, description, and state.
+
+![cronsetup schedule picker](screenshots/cronsetup.png)
+
 ## License
 
 [MIT](../LICENSE)

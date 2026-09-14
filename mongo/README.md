@@ -181,6 +181,36 @@ For a run without interactive prompts, supply `--file`, `--db`, `--mode`, and
 roll back a failed restore. In `replace` mode, a restore failure can leave the
 target empty or partially restored after the original database is dropped.
 
+## Screenshots
+
+Captured from the actual scripts and `fzf` in a demo terminal session. MongoDB
+and SSH responses are mocked; no real databases were exported or restored, and
+no production archives were downloaded.
+
+### export.sh — select databases
+
+Mark one or more databases to create a separate archive for each.
+
+![MongoDB export database picker](screenshots/export.png)
+
+### backup-from-prod.sh — select archives
+
+Review archive dates and sizes, then select the files to download.
+
+![Production backup archive picker](screenshots/backup-from-prod.png)
+
+### import.sh — choose a restore mode
+
+Choose full database replacement, collection replacement, or append mode.
+
+![MongoDB import mode picker](screenshots/import.png)
+
+### import.sh — confirm the restore
+
+Review the source database, target database, and mode before typing `YES`.
+
+![MongoDB import confirmation](screenshots/import-review.png)
+
 ## License
 
 [MIT](../LICENSE)
