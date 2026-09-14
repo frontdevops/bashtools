@@ -1,4 +1,5 @@
 # Backups written by cronedit / cronsetup
+.crontab.backup
 .crontab.backup.*
 *.bak
 

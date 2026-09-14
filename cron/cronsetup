@@ -5,48 +5,24 @@
 #   ./cronsetup dev
 #
 # It never touches the system crontab: it only appends the job to the file.
-# Installing is a separate step: ./cronedit dev
+# Installing is a separate step: cronedit dev
 
 set -Eeuo pipefail
 
-# Resolve the script path through symlinks: cronsetup may live in /usr/local/bin
-# while crontab.*.txt lives in the project directory.
-resolve_script_dir() {
-    local target="$1" dir
-    while [[ -L "$target" ]]; do
-        dir="$(cd "$(dirname "$target")" && pwd)"
-        target="$(readlink "$target")"
-        [[ "$target" == /* ]] || target="$dir/$target"
-    done
-    (cd "$(dirname "$target")" && pwd)
-}
+# Job files belong to the caller's project, regardless of the script's location.
+# An explicit CRONTAB_DIR overrides the working directory; do not fall back to
+# the demo files next to the installed tools.
+JOB_DIR="${CRONTAB_DIR:-$PWD}"
+[[ "$JOB_DIR" == /* ]] || JOB_DIR="$PWD/$JOB_DIR"
 
-SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
-
-# Where to look for crontab.<environment>.txt: CRONTAB_DIR first, then the
-# script directory, then the current directory.
 find_crontab_file() {
-    local env_name="$1" dir
-    for dir in ${CRONTAB_DIR:+"$CRONTAB_DIR"} "$SCRIPT_DIR" "$PWD"; do
-        if [[ -f "$dir/crontab.$env_name.txt" ]]; then
-            printf '%s' "$dir/crontab.$env_name.txt"
-            return 0
-        fi
-    done
-    return 1
+    local file="$JOB_DIR/crontab.$1.txt"
+    [[ -f "$file" ]] || return 1
+    printf '%s' "$file"
 }
 
 searched_dirs() {
-    local env_name="$1" dir out="" seen=""
-    for dir in ${CRONTAB_DIR:+"$CRONTAB_DIR"} "$SCRIPT_DIR" "$PWD"; do
-        case "$seen" in
-            *"|$dir|"*) continue ;;
-        esac
-        seen+="|$dir|"
-        out+="
-    $dir/crontab.$env_name.txt"
-    done
-    printf '%s' "$out"
+    printf '\n    %s/crontab.%s.txt' "$JOB_DIR" "$1"
 }
 
 # Prefix put in front of discovered scripts. Defaults to the project directory
@@ -137,7 +113,7 @@ usage() {
 Usage: $(basename "$0") [dev|prod]
 
 The wizard asks a few questions and appends a ready job to crontab.<environment>.txt.
-Installing it into the system crontab is a separate step: ./cronedit <environment>
+Installing it into the system crontab is a separate step: cronedit <environment>
 USAGE
 }
 
@@ -423,7 +399,7 @@ fi
 success "Job added to $TARGET_FILE (backup: $BACKUP_FILE)"
 
 hr
-log "Install it into the system crontab with: ./cronedit $ENVIRONMENT"
+log "Install it into the system crontab with: cronedit $ENVIRONMENT"
 hr
 
 #EOF#
